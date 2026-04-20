@@ -16,9 +16,11 @@ CHAT_ID = "5629864767"
 symbols = ["BTCUSDT", "ETHUSDT"]
 interval = Client.KLINE_INTERVAL_4HOUR
 
-balance = 1000
+balance = 1000.0
 risk_per_trade = 0.01
-open_trade = None
+max_drawdown = 0.30
+peak_balance = balance
+open_trades = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +111,8 @@ def get_data(symbol: str) -> pd.DataFrame:
 
 
 def main() -> None:
+    global balance, peak_balance
+
     if not check_telegram():
         logging.error(
             "Telegram no responde correctamente. Verifica TOKEN (si da 404, el token es inválido)."
@@ -118,6 +122,13 @@ def main() -> None:
 
     while True:
         try:
+            dd = (peak_balance - balance) / peak_balance if peak_balance > 0 else 0.0
+            if dd >= max_drawdown:
+                logging.error("Drawdown máximo alcanzado: %.2f%%. Bot pausado.", dd * 100)
+                send(f"🛑 Drawdown máximo alcanzado: {dd*100:.2f}%")
+                time.sleep(60)
+                continue
+
             logging.info("🔍 Buscando señal...")
 
             for symbol in symbols:
@@ -130,6 +141,68 @@ def main() -> None:
                 price = row["close"]
                 logging.info("Precio %s: %s", symbol, price)
 
+                atr = row["atr"]
+
+                if symbol in open_trades:
+                    trade = open_trades[symbol]
+                    side = trade["side"]
+                    entry = trade["entry"]
+                    stop = trade["stop"]
+                    tp = trade["tp"]
+                    r_dist = trade["r_dist"]
+
+                    if not trade["be_moved"]:
+                        hit_1r = (side == "long" and price >= entry + r_dist) or (
+                            side == "short" and price <= entry - r_dist
+                        )
+                        if hit_1r:
+                            trade["stop"] = entry
+                            trade["be_moved"] = True
+                            logging.info("Stop movido a break-even")
+
+                    if trade["be_moved"] and not np.isnan(atr):
+                        if side == "long":
+                            new_stop = max(trade["stop"], price - atr)
+                            if new_stop > trade["stop"]:
+                                trade["stop"] = new_stop
+                                logging.info("Trailing activado")
+                        else:
+                            new_stop = min(trade["stop"], price + atr)
+                            if new_stop < trade["stop"]:
+                                trade["stop"] = new_stop
+                                logging.info("Trailing activado")
+
+                    stop = trade["stop"]
+                    tp = trade["tp"]
+
+                    hit_sl = (side == "long" and price <= stop) or (side == "short" and price >= stop)
+                    hit_tp = (side == "long" and price >= tp) or (side == "short" and price <= tp)
+
+                    if hit_sl or hit_tp:
+                        risk_amount = balance * risk_per_trade
+                        pnl = risk_amount * 3 if hit_tp else -risk_amount
+                        balance += pnl
+                        peak_balance = max(peak_balance, balance)
+
+                        result = "TP" if hit_tp else "SL"
+                        logging.info(
+                            "%s cerrado por %s | PnL=%.2f | Balance=%.2f",
+                            symbol,
+                            result,
+                            pnl,
+                            balance,
+                        )
+                        send(
+                            f"📌 TRADE CERRADO\n"
+                            f"{symbol}\n"
+                            f"Resultado: {result}\n"
+                            f"PnL: {pnl:.2f}\n"
+                            f"Balance: {balance:.2f}"
+                        )
+                        del open_trades[symbol]
+
+                    continue
+
                 signal = None
 
                 if prev["close"] < prev["ema20"] and price > row["ema20"]:
@@ -140,7 +213,6 @@ def main() -> None:
                 if signal:
                     logging.info("🚀 SEÑAL %s detectada, aplicando filtros...", signal.upper())
 
-                    atr = row["atr"]
                     atr_ma20 = row["atr_ma20"]
 
                     if np.isnan(atr) or np.isnan(atr_ma20):
@@ -181,9 +253,27 @@ def main() -> None:
                         )
                         continue
 
+                    if signal == "long" and not (row["close"] > prev["high"]):
+                        logging.info("Filtro breakout rechazado LONG")
+                        continue
+
+                    if signal == "short" and not (row["close"] < prev["low"]):
+                        logging.info("Filtro breakout rechazado SHORT")
+                        continue
+
                     stop_dist = atr * 0.8
                     stop = price - stop_dist if signal == "long" else price + stop_dist
                     tp = price + stop_dist * 3 if signal == "long" else price - stop_dist * 3
+
+                    open_trades[symbol] = {
+                        "side": signal,
+                        "entry": price,
+                        "stop": stop,
+                        "tp": tp,
+                        "r_dist": abs(price - stop),
+                        "be_moved": False,
+                        "opened_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
 
                     msg = (
                         f"🚀 TRADE DETECTADO\n"

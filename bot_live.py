@@ -1,4 +1,6 @@
+import csv
 import logging
+import os
 import time
 from datetime import datetime
 
@@ -35,6 +37,20 @@ client = Client(API_KEY, API_SECRET)
 logging.basicConfig(level=logging.INFO)
 
 
+# --- CSV ---
+def init_csv():
+    if not os.path.exists("trades.csv"):
+        with open("trades.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["fecha", "simbolo", "direccion", "precio_entrada", "stop", "tp"])
+
+
+def save_trade(fecha, simbolo, direccion, precio_entrada, stop, tp):
+    with open("trades.csv", "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([fecha, simbolo, direccion, precio_entrada, stop, tp])
+
+
 # --- TELEGRAM ---
 def send(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -46,8 +62,8 @@ def get_data(symbol):
     klines = client.get_klines(symbol=symbol, interval=interval, limit=200)
 
     df = pd.DataFrame(klines, columns=[
-        'time','open','high','low','close','volume',
-        'ct','qav','n','tbbav','tbqav','ignore'
+        'time', 'open', 'high', 'low', 'close', 'volume',
+        'ct', 'qav', 'n', 'tbbav', 'tbqav', 'ignore'
     ])
 
     df['time'] = pd.to_datetime(df['time'], unit='ms')
@@ -57,7 +73,7 @@ def get_data(symbol):
     df['close'] = df['close'].astype(float)
 
     df_1d = df.resample('1D', on='time').agg({
-        'open':'first','high':'max','low':'min','close':'last'
+        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
     }).dropna()
 
     df_1d['ma200'] = df_1d['close'].rolling(200).mean()
@@ -81,6 +97,7 @@ def get_data(symbol):
 
 
 # --- MAIN ---
+init_csv()
 send("🤖 BOT LIVE INICIADO")
 
 while True:
@@ -145,6 +162,9 @@ while True:
             else:
                 stop = price + atr * stop_mult
                 tp = price - (stop - price) * 3
+
+            fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_trade(fecha, symbol, direction, price, stop, tp)
 
             msg = f"""
 🚀 TRADE DETECTADO

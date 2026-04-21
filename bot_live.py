@@ -1,3 +1,4 @@
+
 import csv
 import logging
 import os
@@ -32,7 +33,7 @@ loss_streak = 0
 MAX_DD = 0.15
 MAX_LOSS_STREAK = 8
 
-client = Client(API_KEY, API_SECRET)
+client = Client(API_KEY, API_SECRET, requests_params={"timeout": 10})
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,14 +55,59 @@ def save_trade(fecha, simbolo, direccion, precio_entrada, stop, tp):
 # --- TELEGRAM ---
 def send(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
 
 
 # --- DATA ---
 def get_data(symbol):
-    klines = client.get_klines(symbol=symbol, interval=interval, limit=200)
+    max_retries = 3
+    target_klines = 1000
+    batch_limit = 500
 
-    df = pd.DataFrame(klines, columns=[
+    all_klines = []
+    end_time = None
+
+    while len(all_klines) < target_klines:
+        batch = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logging.info(f"[{symbol}] get_klines intento {attempt}/{max_retries}")
+                params = {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "limit": batch_limit,
+                }
+                if end_time is not None:
+                    params["endTime"] = end_time
+
+                batch = client.get_klines(**params)
+                break
+            except Exception as e:
+                logging.error(f"[{symbol}] Error en get_klines intento {attempt}/{max_retries}: {e}")
+                if attempt == max_retries:
+                    logging.error(f"[{symbol}] Error final tras {max_retries} intentos. Se salta símbolo.")
+                    return None
+                time.sleep(1)
+
+        if not batch:
+            break
+
+        all_klines = batch + all_klines
+
+        oldest_open_time = batch[0][0]
+        end_time = oldest_open_time - 1
+
+        if len(batch) < batch_limit:
+            break
+
+    if not all_klines:
+        return None
+
+    if len(all_klines) > target_klines:
+        all_klines = all_klines[-target_klines:]
+
+    df = pd.DataFrame(all_klines, columns=[
         'time', 'open', 'high', 'low', 'close', 'volume',
         'ct', 'qav', 'n', 'tbbav', 'tbqav', 'ignore'
     ])
@@ -71,6 +117,8 @@ def get_data(symbol):
     df['high'] = df['high'].astype(float)
     df['low'] = df['low'].astype(float)
     df['close'] = df['close'].astype(float)
+
+    df = df.drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
 
     df_1d = df.resample('1D', on='time').agg({
         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
@@ -122,8 +170,11 @@ while True:
         for symbol in symbols:
 
             df = get_data(symbol)
-            row = df.iloc[-1]
-            prev = df.iloc[-2]
+            if df is None or len(df) < 2:
+                continue
+
+            row = df.iloc[-2]
+            prev = df.iloc[-3]
 
             if row['atr'] > row['atr_mean'] * 2:
                 continue

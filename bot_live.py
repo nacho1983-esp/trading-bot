@@ -1,4 +1,3 @@
-
 import csv
 import logging
 import os
@@ -14,24 +13,11 @@ from binance.client import Client
 API_KEY = ""
 API_SECRET = ""
 
-TOKEN = "8620461652:AAH-49pOR11qqhwehF6cf6jKvsEVQxYQMl0"
-CHAT_ID = "5629864767"
+TOKEN = "TU_TOKEN"
+CHAT_ID = "TU_CHAT_ID"
 
 symbols = ["BTCUSDT", "ETHUSDT"]
 interval = Client.KLINE_INTERVAL_4HOUR
-
-balance = 1000
-peak_balance = 1000
-base_risk = 0.01
-
-fee = 0.0004
-slippage = 0.0002
-
-open_trade = None
-loss_streak = 0
-
-MAX_DD = 0.15
-MAX_LOSS_STREAK = 8
 
 client = Client(API_KEY, API_SECRET, requests_params={"timeout": 10})
 
@@ -43,13 +29,16 @@ def init_csv():
     if not os.path.exists("trades.csv"):
         with open("trades.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["fecha", "simbolo", "direccion", "precio_entrada", "stop", "tp"])
+            writer.writerow([
+                "fecha", "simbolo", "direccion",
+                "entrada", "stop", "one_r", "tp"
+            ])
 
 
-def save_trade(fecha, simbolo, direccion, precio_entrada, stop, tp):
+def save_trade(fecha, simbolo, direccion, entrada, stop, one_r, tp):
     with open("trades.csv", "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([fecha, simbolo, direccion, precio_entrada, stop, tp])
+        writer.writerow([fecha, simbolo, direccion, entrada, stop, one_r, tp])
 
 
 # --- TELEGRAM ---
@@ -60,68 +49,24 @@ def send(msg):
 
 # --- DATA ---
 def get_data(symbol):
-    max_retries = 3
-    target_klines = 1000
-    batch_limit = 500
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=1000)
 
-    all_klines = []
-    end_time = None
-
-    while len(all_klines) < target_klines:
-        batch = None
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                logging.info(f"[{symbol}] get_klines intento {attempt}/{max_retries}")
-                params = {
-                    "symbol": symbol,
-                    "interval": interval,
-                    "limit": batch_limit,
-                }
-                if end_time is not None:
-                    params["endTime"] = end_time
-
-                batch = client.get_klines(**params)
-                break
-            except Exception as e:
-                logging.error(f"[{symbol}] Error en get_klines intento {attempt}/{max_retries}: {e}")
-                if attempt == max_retries:
-                    logging.error(f"[{symbol}] Error final tras {max_retries} intentos. Se salta símbolo.")
-                    return None
-                time.sleep(1)
-
-        if not batch:
-            break
-
-        all_klines = batch + all_klines
-
-        oldest_open_time = batch[0][0]
-        end_time = oldest_open_time - 1
-
-        if len(batch) < batch_limit:
-            break
-
-    if not all_klines:
-        return None
-
-    if len(all_klines) > target_klines:
-        all_klines = all_klines[-target_klines:]
-
-    df = pd.DataFrame(all_klines, columns=[
+    df = pd.DataFrame(klines, columns=[
         'time', 'open', 'high', 'low', 'close', 'volume',
         'ct', 'qav', 'n', 'tbbav', 'tbqav', 'ignore'
     ])
 
     df['time'] = pd.to_datetime(df['time'], unit='ms')
-    df['open'] = df['open'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['close'] = df['close'].astype(float)
+    df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
 
-    df = df.drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
+    df = df.sort_values('time')
 
+    # --- INDICADORES (IGUAL QUE BACKTEST) ---
     df_1d = df.resample('1D', on='time').agg({
-        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
     }).dropna()
 
     df_1d['ma200'] = df_1d['close'].rolling(200).mean()
@@ -144,38 +89,34 @@ def get_data(symbol):
     return df
 
 
-# --- MAIN ---
+# --- INIT ---
 init_csv()
-send("🤖 BOT LIVE INICIADO")
+send("🤖 BOT LIVE V5 INICIADO")
 
+last_signal_time = None
+
+
+# --- MAIN LOOP ---
 while True:
 
     try:
         logging.info("🔍 Buscando señal...")
 
-        drawdown = (peak_balance - balance) / peak_balance
-
-        if drawdown > MAX_DD or loss_streak >= MAX_LOSS_STREAK:
-            logging.info("🛑 Sistema pausado por riesgo")
-            time.sleep(60)
-            continue
-
-        if drawdown > 0.1:
-            risk_per_trade = base_risk * 0.5
-        elif drawdown > 0.05:
-            risk_per_trade = base_risk * 0.75
-        else:
-            risk_per_trade = base_risk
-
         for symbol in symbols:
 
             df = get_data(symbol)
-            if df is None or len(df) < 2:
+            if df is None or len(df) < 3:
                 continue
 
             row = df.iloc[-2]
             prev = df.iloc[-3]
 
+            # evitar duplicados
+            candle_time = row['time']
+            if last_signal_time == candle_time:
+                continue
+
+            # --- FILTROS (IGUAL QUE BACKTEST) ---
             if row['atr'] > row['atr_mean'] * 2:
                 continue
 
@@ -189,6 +130,7 @@ while True:
             else:
                 continue
 
+            # EMA CROSS
             if direction == "long":
                 if prev['close'] > prev['ema20']:
                     continue
@@ -205,32 +147,47 @@ while True:
                 continue
 
             price = row['close']
-            stop_mult = 0.8
+            stop_mult = 1.2
 
+            # --- EXACTO BACKTEST V5 ---
             if direction == "long":
                 stop = price - atr * stop_mult
-                tp = price + (price - stop) * 3
+                one_r = price + (price - stop)
+                tp = price + (price - stop) * 2
             else:
                 stop = price + atr * stop_mult
-                tp = price - (stop - price) * 3
+                one_r = price - (stop - price)
+                tp = price - (stop - price) * 2
 
+            # --- SAVE ---
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_trade(fecha, symbol, direction, price, stop, tp)
+            save_trade(fecha, symbol, direction, price, stop, one_r, tp)
 
+            last_signal_time = candle_time
+
+            # --- MENSAJE ---
             msg = f"""
-🚀 TRADE DETECTADO
-{symbol}
+🚀 TRADE DETECTADO (V5)
 
+{symbol}
 Tipo: {direction}
+
 Entrada: {round(price,2)}
 Stop: {round(stop,2)}
-TP: {round(tp,2)}
+
+🎯 Parcial (1R): {round(one_r,2)}
+🎯 TP final (2R): {round(tp,2)}
+
+Gestión:
+- 50% en 1R
+- Stop a Break Even
+- Resto hasta 2R
 """
 
             send(msg)
             logging.info(msg)
 
-        time.sleep(60)
+        time.sleep(300)
 
     except Exception as e:
         logging.error(e)

@@ -53,8 +53,7 @@ eth = prepare(load_data("ethereum.xlsx"))
 assets = [btc, eth]
 
 balance = 1000
-peak_balance = 1000
-base_risk = 0.01
+risk_per_trade = 0.01
 
 fee = 0.0004
 slippage = 0.0002
@@ -62,55 +61,41 @@ slippage = 0.0002
 equity = []
 drawdowns = []
 
+peak_balance = balance
+
 trade_count = 0
 wins = 0
 losses = 0
 
-open_trade = False
-loss_streak = 0
+total_R = 0
 
-MAX_DD = 0.15
-MAX_LOSS_STREAK = 8
-
-system_active = True
+# --- NUEVO ---
+last_trade_index = -50
+cooldown = 3
 
 
-for i in range(50, len(btc)-20):
-
-    drawdown = (peak_balance - balance) / peak_balance
-    drawdowns.append(drawdown)
-
-    if drawdown > MAX_DD:
-        system_active = False
-
-    if not system_active:
-        equity.append(balance)
-        continue
-
-    if loss_streak >= MAX_LOSS_STREAK:
-        equity.append(balance)
-        continue
-
-    if drawdown > 0.1:
-        risk_per_trade = base_risk * 0.5
-    elif drawdown > 0.05:
-        risk_per_trade = base_risk * 0.75
-    else:
-        risk_per_trade = base_risk
-
-    if open_trade:
-        equity.append(balance)
-        continue
+for i in range(200, len(btc)-1):
 
     for df in assets:
 
         row = df.iloc[i]
         prev = df.iloc[i-1]
 
+        # --- COOLDOWN ---
+        if i - last_trade_index < cooldown:
+            continue
+
+        # --- FILTROS BASE ---
+
         if row['atr'] > row['atr_mean'] * 2:
             continue
 
         if row['dist_ma'] < 0.01:
+            continue
+
+        # --- NUEVO: FILTRO SUAVE DE MOMENTUM ---
+        momentum = abs(row['close'] - prev['close']) / prev['close']
+        if momentum < 0.002:
             continue
 
         if row['close'] > row['ma200']:
@@ -120,6 +105,7 @@ for i in range(50, len(btc)-20):
         else:
             continue
 
+        # EMA cross limpio
         if direction == "long":
             if prev['close'] > prev['ema20']:
                 continue
@@ -136,101 +122,104 @@ for i in range(50, len(btc)-20):
             continue
 
         price = row['close']
-        stop_mult = 0.8
+        stop_mult = 1.2
 
         if direction == "long":
             stop = price - atr * stop_mult
-            tp = price + (price - stop) * 3
             one_r = price + (price - stop)
+            tp = price + (price - stop) * 2
         else:
             stop = price + atr * stop_mult
-            tp = price - (stop - price) * 3
             one_r = price - (stop - price)
+            tp = price - (stop - price) * 2
 
         risk = balance * risk_per_trade
+
+        future = df.iloc[i+1:]
+        trade_open = True
         half_closed = False
 
-        future = df.iloc[i+1:i+20]
-        open_trade = True
-
-        for j, f in enumerate(future.iterrows()):
-            f = f[1]
-
-            if j > 10 and not half_closed:
-                balance -= risk * 0.5
-                losses += 1
-                loss_streak += 1
-                trade_count += 1
-                open_trade = False
-                break
+        for _, f in future.iterrows():
 
             if direction == "long":
 
+                # parcial
                 if not half_closed and f['high'] >= one_r:
-                    balance += risk * (1 - fee - slippage)
+                    balance += risk * 0.5 * (1 - fee - slippage)
+                    total_R += 0.5
                     half_closed = True
                     stop = price
 
+                # stop
                 if f['low'] <= stop:
                     if not half_closed:
                         balance -= risk * (1 + fee + slippage)
+                        total_R -= 1
                         losses += 1
-                        loss_streak += 1
                     else:
-                        loss_streak = 0
-
+                        wins += 1
                     trade_count += 1
-                    open_trade = False
+                    trade_open = False
                     break
 
+                # tp
                 if f['high'] >= tp:
-                    balance += risk * 2 * (1 - fee - slippage)
+                    balance += risk * 1.5 * (1 - fee - slippage)
+                    total_R += 1.5
                     wins += 1
-                    loss_streak = 0
                     trade_count += 1
-                    open_trade = False
+                    trade_open = False
                     break
 
             else:
 
                 if not half_closed and f['low'] <= one_r:
-                    balance += risk * (1 - fee - slippage)
+                    balance += risk * 0.5 * (1 - fee - slippage)
+                    total_R += 0.5
                     half_closed = True
                     stop = price
 
                 if f['high'] >= stop:
                     if not half_closed:
                         balance -= risk * (1 + fee + slippage)
+                        total_R -= 1
                         losses += 1
-                        loss_streak += 1
                     else:
-                        loss_streak = 0
-
+                        wins += 1
                     trade_count += 1
-                    open_trade = False
+                    trade_open = False
                     break
 
                 if f['low'] <= tp:
-                    balance += risk * 2 * (1 - fee - slippage)
+                    balance += risk * 1.5 * (1 - fee - slippage)
+                    total_R += 1.5
                     wins += 1
-                    loss_streak = 0
                     trade_count += 1
-                    open_trade = False
+                    trade_open = False
                     break
 
-        break
+        if not trade_open:
+            last_trade_index = i
+            break
 
     peak_balance = max(peak_balance, balance)
+    dd = (peak_balance - balance) / peak_balance
+
     equity.append(balance)
+    drawdowns.append(dd)
 
 
+# --- RESULTADOS ---
 max_dd = max(drawdowns) if drawdowns else 0
+winrate = wins / trade_count if trade_count > 0 else 0
+expectancy = total_R / trade_count if trade_count > 0 else 0
 
-print("Balance final:", round(balance,2))
-print("Max Drawdown:", round(max_dd*100,2), "%")
+print("Balance final:", round(balance, 2))
+print("Max Drawdown:", round(max_dd * 100, 2), "%")
 print("Trades:", trade_count)
-print("Winrate:", round(wins/trade_count,2) if trade_count > 0 else 0)
+print("Winrate:", round(winrate, 2))
+print("Expectancy (R):", round(expectancy, 2))
 
 plt.plot(equity)
-plt.title("Equity Curve (SAFE SYSTEM)")
+plt.title("Equity Curve (FINAL VERSION)")
 plt.show()

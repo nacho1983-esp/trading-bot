@@ -19,6 +19,16 @@ CHAT_ID = "TU_CHAT_ID"
 symbols = ["BTCUSDT", "ETHUSDT"]
 interval = Client.KLINE_INTERVAL_4HOUR
 
+balance = 1000
+peak_balance = 1000
+base_risk = 0.01
+
+fee = 0.0004
+slippage = 0.0002
+
+MAX_DD = 0.15
+MAX_LOSS_STREAK = 8
+
 client = Client(API_KEY, API_SECRET, requests_params={"timeout": 10})
 
 logging.basicConfig(level=logging.INFO)
@@ -29,49 +39,52 @@ def init_csv():
     if not os.path.exists("trades.csv"):
         with open("trades.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "fecha", "simbolo", "direccion",
-                "entrada", "stop", "one_r", "tp"
-            ])
+            writer.writerow(["fecha", "simbolo", "direccion", "precio_entrada", "stop", "tp"])
 
 
-def save_trade(fecha, simbolo, direccion, entrada, stop, one_r, tp):
+def save_trade(fecha, simbolo, direccion, precio_entrada, stop, tp):
     with open("trades.csv", "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([fecha, simbolo, direccion, entrada, stop, one_r, tp])
+        writer.writerow([fecha, simbolo, direccion, precio_entrada, stop, tp])
 
 
 # --- TELEGRAM ---
 def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except:
+        logging.error("Error enviando Telegram")
 
 
 # --- DATA ---
 def get_data(symbol):
-    klines = client.get_klines(symbol=symbol, interval=interval, limit=1000)
+    try:
+        klines = client.get_klines(symbol=symbol, interval=interval, limit=1000)
+    except Exception as e:
+        logging.error(f"{symbol} error Binance: {e}")
+        return None
 
     df = pd.DataFrame(klines, columns=[
-        'time', 'open', 'high', 'low', 'close', 'volume',
-        'ct', 'qav', 'n', 'tbbav', 'tbqav', 'ignore'
+        'time','open','high','low','close','volume',
+        'ct','qav','n','tbbav','tbqav','ignore'
     ])
 
     df['time'] = pd.to_datetime(df['time'], unit='ms')
-    df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
 
-    df = df.sort_values('time')
-
-    # --- INDICADORES (IGUAL QUE BACKTEST) ---
+    # --- MA200 diaria ---
     df_1d = df.resample('1D', on='time').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last'
+        'open':'first','high':'max','low':'min','close':'last'
     }).dropna()
 
     df_1d['ma200'] = df_1d['close'].rolling(200).mean()
     df['ma200'] = df_1d['ma200'].reindex(df['time'], method='ffill').values
 
+    # --- indicadores ---
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['dist_ma'] = abs(df['close'] - df['ma200']) / df['ma200']
 
@@ -89,14 +102,10 @@ def get_data(symbol):
     return df
 
 
-# --- INIT ---
+# --- MAIN ---
 init_csv()
-send("🤖 BOT LIVE V5 INICIADO")
+send("🤖 BOT INICIADO")
 
-last_signal_time = None
-
-
-# --- MAIN LOOP ---
 while True:
 
     try:
@@ -105,22 +114,24 @@ while True:
         for symbol in symbols:
 
             df = get_data(symbol)
-            if df is None or len(df) < 3:
+            if df is None or len(df) < 5:
                 continue
 
+            # 🔥 VELA CERRADA
             row = df.iloc[-2]
             prev = df.iloc[-3]
 
-            # evitar duplicados
-            candle_time = row['time']
-            if last_signal_time == candle_time:
-                continue
+            # --- DEBUG CLARO ---
+            logging.info(
+                f"{symbol} | close={row['close']:.2f} ema20={row['ema20']:.2f} ma200={row['ma200']:.2f}"
+            )
 
-            # --- FILTROS (IGUAL QUE BACKTEST) ---
+            # --- FILTROS ---
             if row['atr'] > row['atr_mean'] * 2:
                 continue
 
             if row['dist_ma'] < 0.01:
+                logging.info(f"{symbol} ❌ dist_ma")
                 continue
 
             if row['close'] > row['ma200']:
@@ -130,14 +141,15 @@ while True:
             else:
                 continue
 
-            # EMA CROSS
             if direction == "long":
                 if prev['close'] > prev['ema20']:
+                    logging.info(f"{symbol} ❌ EMA20 long")
                     continue
                 if row['close'] <= row['ema20']:
                     continue
             else:
                 if prev['close'] < prev['ema20']:
+                    logging.info(f"{symbol} ❌ EMA20 short")
                     continue
                 if row['close'] >= row['ema20']:
                     continue
@@ -147,46 +159,33 @@ while True:
                 continue
 
             price = row['close']
-            stop_mult = 1.2
+            stop_mult = 0.8
 
-            # --- EXACTO BACKTEST V5 ---
             if direction == "long":
                 stop = price - atr * stop_mult
-                one_r = price + (price - stop)
-                tp = price + (price - stop) * 2
+                tp = price + (price - stop) * 3
             else:
                 stop = price + atr * stop_mult
-                one_r = price - (stop - price)
-                tp = price - (stop - price) * 2
+                tp = price - (stop - price) * 3
 
-            # --- SAVE ---
+            # --- GUARDAR TRADE ---
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_trade(fecha, symbol, direction, price, stop, one_r, tp)
+            save_trade(fecha, symbol, direction, price, stop, tp)
 
-            last_signal_time = candle_time
-
-            # --- MENSAJE ---
             msg = f"""
-🚀 TRADE DETECTADO (V5)
-
+🚀 TRADE DETECTADO
 {symbol}
-Tipo: {direction}
 
+Tipo: {direction}
 Entrada: {round(price,2)}
 Stop: {round(stop,2)}
-
-🎯 Parcial (1R): {round(one_r,2)}
-🎯 TP final (2R): {round(tp,2)}
-
-Gestión:
-- 50% en 1R
-- Stop a Break Even
-- Resto hasta 2R
+TP: {round(tp,2)}
 """
 
             send(msg)
             logging.info(msg)
 
+        # 🔥 NO NECESITAS 60s EN 4H
         time.sleep(300)
 
     except Exception as e:

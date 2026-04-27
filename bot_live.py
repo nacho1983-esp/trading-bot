@@ -60,7 +60,7 @@ def send(msg):
 # --- DATA ---
 def get_data(symbol):
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=1000)
+        klines = client.get_klines(symbol=symbol, interval=interval, limit=1500)
     except Exception as e:
         logging.error(f"{symbol} error Binance: {e}")
         return None

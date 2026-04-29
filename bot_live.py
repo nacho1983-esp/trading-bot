@@ -19,20 +19,9 @@ CHAT_ID = "TU_CHAT_ID"
 symbols = ["BTCUSDT", "ETHUSDT"]
 interval = Client.KLINE_INTERVAL_4HOUR
 
-balance = 1000
-peak_balance = 1000
-base_risk = 0.01
-
-fee = 0.0004
-slippage = 0.0002
-
-MAX_DD = 0.15
-MAX_LOSS_STREAK = 8
-
 client = Client(API_KEY, API_SECRET, requests_params={"timeout": 10})
 
 logging.basicConfig(level=logging.INFO)
-
 
 # --- CSV ---
 def init_csv():
@@ -41,26 +30,23 @@ def init_csv():
             writer = csv.writer(f)
             writer.writerow(["fecha", "simbolo", "direccion", "precio_entrada", "stop", "tp"])
 
-
 def save_trade(fecha, simbolo, direccion, precio_entrada, stop, tp):
     with open("trades.csv", "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([fecha, simbolo, direccion, precio_entrada, stop, tp])
-
 
 # --- TELEGRAM ---
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except:
-        logging.error("Error enviando Telegram")
-
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
 
 # --- DATA ---
 def get_data(symbol):
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=1500)
+        klines = client.get_klines(symbol=symbol, interval=interval, limit=1000)
     except Exception as e:
         logging.error(f"{symbol} error Binance: {e}")
         return None
@@ -76,13 +62,8 @@ def get_data(symbol):
     df['low'] = df['low'].astype(float)
     df['close'] = df['close'].astype(float)
 
-    # --- MA200 diaria ---
-    df_1d = df.resample('1D', on='time').agg({
-        'open':'first','high':'max','low':'min','close':'last'
-    }).dropna()
-
-    df_1d['ma200'] = df_1d['close'].rolling(200).mean()
-    df['ma200'] = df_1d['ma200'].reindex(df['time'], method='ffill').values
+    # --- 🔥 FIX REAL: MA200 EN 4H (NO DIARIA) ---
+    df['ma200'] = df['close'].rolling(200).mean()
 
     # --- indicadores ---
     df['ema20'] = df['close'].ewm(span=20).mean()
@@ -101,7 +82,6 @@ def get_data(symbol):
 
     return df
 
-
 # --- MAIN ---
 init_csv()
 send("🤖 BOT INICIADO")
@@ -114,26 +94,31 @@ while True:
         for symbol in symbols:
 
             df = get_data(symbol)
-            if df is None or len(df) < 5:
+            if df is None or len(df) < 210:
                 continue
 
-            # 🔥 VELA CERRADA
+            # 🔥 vela cerrada
             row = df.iloc[-2]
             prev = df.iloc[-3]
 
-            # --- DEBUG CLARO ---
+            # 🔍 DEBUG CLARO
             logging.info(
                 f"{symbol} | close={row['close']:.2f} ema20={row['ema20']:.2f} ma200={row['ma200']:.2f}"
             )
+
+            # evitar NaN
+            if np.isnan(row['ma200']):
+                logging.info(f"{symbol} ❌ ma200 nan")
+                continue
 
             # --- FILTROS ---
             if row['atr'] > row['atr_mean'] * 2:
                 continue
 
             if row['dist_ma'] < 0.01:
-                logging.info(f"{symbol} ❌ dist_ma")
                 continue
 
+            # --- DIRECCIÓN ---
             if row['close'] > row['ma200']:
                 direction = "long"
             elif row['close'] < row['ma200']:
@@ -141,15 +126,14 @@ while True:
             else:
                 continue
 
+            # --- CRUCE EMA20 ---
             if direction == "long":
                 if prev['close'] > prev['ema20']:
-                    logging.info(f"{symbol} ❌ EMA20 long")
                     continue
                 if row['close'] <= row['ema20']:
                     continue
             else:
                 if prev['close'] < prev['ema20']:
-                    logging.info(f"{symbol} ❌ EMA20 short")
                     continue
                 if row['close'] >= row['ema20']:
                     continue
@@ -168,7 +152,7 @@ while True:
                 stop = price + atr * stop_mult
                 tp = price - (stop - price) * 3
 
-            # --- GUARDAR TRADE ---
+            # --- GUARDAR ---
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_trade(fecha, symbol, direction, price, stop, tp)
 
@@ -185,7 +169,6 @@ TP: {round(tp,2)}
             send(msg)
             logging.info(msg)
 
-        # 🔥 NO NECESITAS 60s EN 4H
         time.sleep(300)
 
     except Exception as e:

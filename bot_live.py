@@ -23,6 +23,9 @@ client = Client(API_KEY, API_SECRET, requests_params={"timeout": 10})
 
 logging.basicConfig(level=logging.INFO)
 
+# --- CONTROL ---
+last_signal_time = {}
+
 # --- CSV ---
 def init_csv():
     if not os.path.exists("trades.csv"):
@@ -62,7 +65,7 @@ def get_data(symbol):
     df['low'] = df['low'].astype(float)
     df['close'] = df['close'].astype(float)
 
-    # --- 🔥 FIX REAL: MA200 EN 4H (NO DIARIA) ---
+    # --- MA200 correcta ---
     df['ma200'] = df['close'].rolling(200).mean()
 
     # --- indicadores ---
@@ -97,28 +100,33 @@ while True:
             if df is None or len(df) < 210:
                 continue
 
-            # 🔥 vela cerrada
+            # --- vela cerrada ---
             row = df.iloc[-2]
             prev = df.iloc[-3]
 
-            # 🔍 DEBUG CLARO
+            candle_time = row['time']
+
+            # --- evitar repetir trade en misma vela ---
+            if symbol in last_signal_time and last_signal_time[symbol] == candle_time:
+                logging.info(f"{symbol} ⏳ señal ya ejecutada en esta vela")
+                continue
+
+            # --- debug ---
             logging.info(
                 f"{symbol} | close={row['close']:.2f} ema20={row['ema20']:.2f} ma200={row['ma200']:.2f}"
             )
 
-            # evitar NaN
             if np.isnan(row['ma200']):
-                logging.info(f"{symbol} ❌ ma200 nan")
                 continue
 
-            # --- FILTROS ---
+            # --- filtros ---
             if row['atr'] > row['atr_mean'] * 2:
                 continue
 
             if row['dist_ma'] < 0.01:
                 continue
 
-            # --- DIRECCIÓN ---
+            # --- dirección ---
             if row['close'] > row['ma200']:
                 direction = "long"
             elif row['close'] < row['ma200']:
@@ -126,7 +134,7 @@ while True:
             else:
                 continue
 
-            # --- CRUCE EMA20 ---
+            # --- cruce EMA ---
             if direction == "long":
                 if prev['close'] > prev['ema20']:
                     continue
@@ -152,7 +160,10 @@ while True:
                 stop = price + atr * stop_mult
                 tp = price - (stop - price) * 3
 
-            # --- GUARDAR ---
+            # --- guardar control ---
+            last_signal_time[symbol] = candle_time
+
+            # --- guardar trade ---
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_trade(fecha, symbol, direction, price, stop, tp)
 

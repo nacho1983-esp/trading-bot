@@ -24,165 +24,276 @@ client = Client(API_KEY, API_SECRET, requests_params={"timeout": 10})
 logging.basicConfig(level=logging.INFO)
 
 # --- CONTROL ---
-last_signal_time = {}
+last_signal = None
 
 # --- CSV ---
 def init_csv():
     if not os.path.exists("trades.csv"):
         with open("trades.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["fecha", "simbolo", "direccion", "precio_entrada", "stop", "tp"])
+            writer.writerow([
+                "fecha",
+                "simbolo",
+                "direccion",
+                "precio_entrada",
+                "stop",
+                "tp"
+            ])
 
 def save_trade(fecha, simbolo, direccion, precio_entrada, stop, tp):
     with open("trades.csv", "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([fecha, simbolo, direccion, precio_entrada, stop, tp])
+        writer.writerow([
+            fecha,
+            simbolo,
+            direccion,
+            precio_entrada,
+            stop,
+            tp
+        ])
 
 # --- TELEGRAM ---
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+
+        requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": msg
+            },
+            timeout=10
+        )
+
     except Exception as e:
         logging.error(f"Telegram error: {e}")
 
 # --- DATA ---
 def get_data(symbol):
-    try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=1000)
-    except Exception as e:
-        logging.error(f"{symbol} error Binance: {e}")
-        return None
 
-    df = pd.DataFrame(klines, columns=[
-        'time','open','high','low','close','volume',
-        'ct','qav','n','tbbav','tbqav','ignore'
-    ])
+    max_retries = 3
 
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    df['open'] = df['open'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['close'] = df['close'].astype(float)
+    for attempt in range(max_retries):
 
-    # --- MA200 correcta ---
-    df['ma200'] = df['close'].rolling(200).mean()
+        try:
 
-    # --- indicadores ---
-    df['ema20'] = df['close'].ewm(span=20).mean()
-    df['dist_ma'] = abs(df['close'] - df['ma200']) / df['ma200']
+            klines = client.get_klines(
+                symbol=symbol,
+                interval=interval,
+                limit=1000
+            )
 
-    df['tr'] = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift()),
-            abs(df['low'] - df['close'].shift())
-        )
-    )
+            df = pd.DataFrame(klines, columns=[
+                'time',
+                'open',
+                'high',
+                'low',
+                'close',
+                'volume',
+                'ct',
+                'qav',
+                'n',
+                'tbbav',
+                'tbqav',
+                'ignore'
+            ])
 
-    df['atr'] = df['tr'].rolling(14).mean()
-    df['atr_mean'] = df['atr'].rolling(50).mean()
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
 
-    return df
+            numeric_cols = ['open', 'high', 'low', 'close']
+
+            for col in numeric_cols:
+                df[col] = df[col].astype(float)
+
+            # --- MA200 ---
+            df['ma200'] = df['close'].rolling(200).mean()
+
+            # --- EMA20 ---
+            df['ema20'] = df['close'].ewm(
+                span=20,
+                adjust=False
+            ).mean()
+
+            # --- DISTANCIA MA ---
+            df['dist_ma'] = (
+                abs(df['close'] - df['ma200']) / df['ma200']
+            )
+
+            # --- ATR ---
+            df['tr'] = np.maximum(
+                df['high'] - df['low'],
+                np.maximum(
+                    abs(df['high'] - df['close'].shift()),
+                    abs(df['low'] - df['close'].shift())
+                )
+            )
+
+            df['atr'] = df['tr'].rolling(14).mean()
+            df['atr_mean'] = df['atr'].rolling(50).mean()
+
+            return df
+
+        except Exception as e:
+
+            logging.error(
+                f"{symbol} error Binance intento {attempt + 1}: {e}"
+            )
+
+            time.sleep(2)
+
+    return None
 
 # --- MAIN ---
 init_csv()
+
 send("🤖 BOT INICIADO")
 
 while True:
 
     try:
+
         logging.info("🔍 Buscando señal...")
 
         for symbol in symbols:
 
             df = get_data(symbol)
+
             if df is None or len(df) < 210:
                 continue
 
-            # --- vela cerrada ---
+            # --- USAR VELA CERRADA ---
             row = df.iloc[-2]
             prev = df.iloc[-3]
 
-            candle_time = row['time']
-
-            # --- evitar repetir trade en misma vela ---
-            if symbol in last_signal_time and last_signal_time[symbol] == candle_time:
-                logging.info(f"{symbol} ⏳ señal ya ejecutada en esta vela")
-                continue
-
-            # --- debug ---
             logging.info(
-                f"{symbol} | close={row['close']:.2f} ema20={row['ema20']:.2f} ma200={row['ma200']:.2f}"
+                f"{symbol} | "
+                f"close={row['close']:.2f} "
+                f"ema20={row['ema20']:.2f} "
+                f"ma200={row['ma200']:.2f}"
             )
 
+            # --- VALIDACIONES ---
             if np.isnan(row['ma200']):
                 continue
 
-            # --- filtros ---
+            if np.isnan(row['atr']):
+                continue
+
+            if np.isnan(row['atr_mean']):
+                continue
+
+            # --- FILTRO VOLATILIDAD ---
             if row['atr'] > row['atr_mean'] * 2:
+                logging.info(f"{symbol} ❌ ATR alto")
                 continue
 
+            # --- FILTRO DISTANCIA ---
             if row['dist_ma'] < 0.01:
+                logging.info(f"{symbol} ❌ dist_ma")
                 continue
 
-            # --- dirección ---
+            # --- DIRECCIÓN ---
             if row['close'] > row['ma200']:
                 direction = "long"
+
             elif row['close'] < row['ma200']:
                 direction = "short"
+
             else:
                 continue
 
-            # --- cruce EMA ---
+            # --- CRUCE EMA20 ---
             if direction == "long":
+
                 if prev['close'] > prev['ema20']:
+                    logging.info(f"{symbol} ❌ EMA20 long")
                     continue
+
                 if row['close'] <= row['ema20']:
                     continue
+
             else:
+
                 if prev['close'] < prev['ema20']:
+                    logging.info(f"{symbol} ❌ EMA20 short")
                     continue
+
                 if row['close'] >= row['ema20']:
                     continue
 
-            atr = row['atr']
-            if np.isnan(atr):
+            # --- PRECIOS ---
+            price = row['close']
+
+            signal_id = f"{symbol}_{direction}_{round(price, 2)}"
+
+            # --- EVITAR DUPLICADOS ---
+            if last_signal == signal_id:
+                logging.info(f"{symbol} ⏳ señal ya ejecutada")
                 continue
 
-            price = row['close']
+            atr = row['atr']
             stop_mult = 0.8
 
             if direction == "long":
+
                 stop = price - atr * stop_mult
-                tp = price + (price - stop) * 3
+
+                tp = price + (
+                    (price - stop) * 3
+                )
+
             else:
+
                 stop = price + atr * stop_mult
-                tp = price - (stop - price) * 3
 
-            # --- guardar control ---
-            last_signal_time[symbol] = candle_time
+                tp = price - (
+                    (stop - price) * 3
+                )
 
-            # --- guardar trade ---
-            fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_trade(fecha, symbol, direction, price, stop, tp)
+            # --- GUARDAR ÚLTIMA SEÑAL ---
+            last_signal = signal_id
 
+            # --- GUARDAR CSV ---
+            fecha = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            save_trade(
+                fecha,
+                symbol,
+                direction,
+                round(price, 2),
+                round(stop, 2),
+                round(tp, 2)
+            )
+
+            # --- TELEGRAM ---
             msg = f"""
 🚀 TRADE DETECTADO
+
 {symbol}
 
 Tipo: {direction}
-Entrada: {round(price,2)}
-Stop: {round(stop,2)}
-TP: {round(tp,2)}
+
+Entrada: {round(price, 2)}
+
+Stop: {round(stop, 2)}
+
+TP: {round(tp, 2)}
 """
 
             send(msg)
+
             logging.info(msg)
 
+        # --- ESPERA ---
         time.sleep(300)
 
     except Exception as e:
-        logging.error(e)
-        send(f"⚠️ ERROR {e}")
+
+        logging.error(f"ERROR LOOP: {e}")
+
+        send(f"⚠️ ERROR: {e}")
+
         time.sleep(60)
